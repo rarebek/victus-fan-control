@@ -1,0 +1,1267 @@
+#!/usr/bin/env python3
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import warnings
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
+def gtk_log_handler(domain, level, message, user_data):
+    if "gtk_widget_get_scale_factor" in message:
+        return
+    GLib.log_default_handler(domain, level, message, user_data)
+
+
+GLib.log_set_handler("Gtk", GLib.LogLevelFlags.LEVEL_CRITICAL, gtk_log_handler, None)
+
+
+APP_ID = "victus-fan-control"
+LEGACY_APP_ID = "hp-fan-control"
+APP_NAME = "Victus Fan Control"
+HWMON_ROOT = Path("/sys/class/hwmon")
+STATE_ROOT = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+CONFIG_ROOT = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+STATE_DIR = Path(os.environ.get("FANCTL_STATE_DIR", str(STATE_ROOT / APP_ID)))
+CONFIG_DIR = Path(os.environ.get("FANCTL_CONFIG_DIR", str(CONFIG_ROOT / APP_ID)))
+CONFIG_FILE = CONFIG_DIR / "config.json"
+LEGACY_CONFIG_FILE = CONFIG_ROOT / LEGACY_APP_ID / "config.json"
+EVENT_LOG = STATE_DIR / "events.log"
+AUTOSTART_FILE = Path.home() / ".config/autostart" / f"{APP_ID}.desktop"
+
+
+def resolve_fanctl():
+    override = os.environ.get("FANCTL")
+    if override:
+        return override
+
+    sibling = Path(__file__).resolve().with_name("fanctl")
+    if sibling.exists():
+        return str(sibling)
+
+    found = shutil.which("fanctl")
+    return found or "fanctl"
+
+
+def resolve_gui():
+    current = Path(sys.argv[0])
+    if current.is_absolute() or current.parent != Path("."):
+        return str(current.resolve())
+
+    found = shutil.which(current.name)
+    return found or "fanctl-gui"
+
+
+FANCTL = resolve_fanctl()
+GUI_EXEC = resolve_gui()
+
+
+DEFAULT_CONFIG = {
+    "refresh_interval": 2,
+    "notifications": True,
+    "tray": True,
+    "reset_on_start": False,
+    "reset_on_exit": False,
+    "autostart": False,
+    "gpu_monitoring": True,
+    "auto_boost_enabled": False,
+    "cpu_on": 80,
+    "cpu_off": 68,
+    "gpu_on": 78,
+    "gpu_off": 65,
+    "gpu_util_on": 60,
+    "gpu_util_off": 20,
+    "activate_delay": 6,
+    "deactivate_delay": 45,
+    "high_cpu_warning": 92,
+    "high_gpu_warning": 86,
+    "better_auto_enabled": False,
+    "better_auto_levels": [
+        {"temp": 50, "percent": 35},
+        {"temp": 62, "percent": 50},
+        {"temp": 72, "percent": 70},
+        {"temp": 82, "percent": 100},
+    ],
+}
+
+
+def ensure_dirs():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_config():
+    ensure_dirs()
+    source = CONFIG_FILE
+    if not source.exists() and LEGACY_CONFIG_FILE.exists():
+        source = LEGACY_CONFIG_FILE
+
+    if not source.exists():
+        config = dict(DEFAULT_CONFIG)
+        save_config(config)
+        return config
+
+    try:
+        loaded = json.loads(source.read_text())
+    except (OSError, json.JSONDecodeError):
+        return dict(DEFAULT_CONFIG)
+
+    config = dict(DEFAULT_CONFIG)
+    config.update({k: v for k, v in loaded.items() if k in DEFAULT_CONFIG})
+    return config
+
+
+def save_config(config):
+    ensure_dirs()
+    CONFIG_FILE.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def write_log(message):
+    ensure_dirs()
+    with EVENT_LOG.open("a") as handle:
+        handle.write(f"{time.strftime('%F %T')} {message}\n")
+
+
+def hwmon_by_name(name):
+    for path in sorted(HWMON_ROOT.glob("hwmon*")):
+        if read_text(path / "name") == name:
+            return path
+    return None
+
+
+def hp_hwmon():
+    return hwmon_by_name("hp")
+
+
+def parse_int(value):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def milli_to_c(raw):
+    value = parse_int(raw)
+    if value is None:
+        return None
+    return value / 1000.0
+
+
+def fan_mode():
+    hwmon = hp_hwmon()
+    if not hwmon:
+        return {"raw": None, "label": "unavailable"}
+
+    raw = read_text(hwmon / "pwm1_enable")
+    label = {
+        "0": "max",
+        "1": "manual",
+        "2": "auto",
+    }.get(raw, f"unknown ({raw or 'n/a'})")
+    return {"raw": raw, "label": label}
+
+
+def runtime_dir():
+    return Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+
+
+def max_hold_pid():
+    raw = read_text(runtime_dir() / "fanctl-max.pid")
+    if not raw or not raw.isdigit():
+        return None
+    pid = int(raw)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def max_hold_deadline():
+    raw = read_text(runtime_dir() / "fanctl-max.deadline")
+    if not raw or not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def fan_rpms():
+    hwmon = hp_hwmon()
+    result = {
+        "fan1": None,
+        "fan2": None,
+        "fan1_target": None,
+        "fan2_target": None,
+        "fan1_max": None,
+        "fan2_max": None,
+    }
+    if not hwmon:
+        return result
+
+    for idx in (1, 2):
+        result[f"fan{idx}"] = parse_int(read_text(hwmon / f"fan{idx}_input"))
+        result[f"fan{idx}_target"] = parse_int(read_text(hwmon / f"fan{idx}_target"))
+        result[f"fan{idx}_max"] = parse_int(read_text(hwmon / f"fan{idx}_max"))
+    return result
+
+
+def capability_map():
+    hwmon = hp_hwmon()
+    caps = {
+        "hp_hwmon": bool(hwmon),
+        "fan_mode": False,
+        "fan_rpm": False,
+        "manual_targets": False,
+        "manual_targets_writable": False,
+        "fan_max": False,
+        "keyboard_rgb": False,
+        "singlezone_rgb": False,
+        "fourzone_rgb": False,
+    }
+    if hwmon:
+        caps["fan_mode"] = (hwmon / "pwm1_enable").exists()
+        caps["fan_rpm"] = (hwmon / "fan1_input").exists() or (hwmon / "fan2_input").exists()
+        caps["manual_targets"] = (hwmon / "fan1_target").exists() and (hwmon / "fan2_target").exists()
+        caps["manual_targets_writable"] = os.access(hwmon / "fan1_target", os.W_OK) and os.access(hwmon / "fan2_target", os.W_OK)
+        caps["fan_max"] = (hwmon / "fan1_max").exists() and (hwmon / "fan2_max").exists()
+
+    single = Path("/sys/class/leds/hp::kbd_backlight")
+    zones = Path("/sys/devices/platform/hp-wmi/rgb_zones")
+    caps["singlezone_rgb"] = (single / "multi_intensity").exists() or (single / "brightness").exists()
+    caps["fourzone_rgb"] = (zones / "zone00").exists()
+    caps["keyboard_rgb"] = caps["singlezone_rgb"] or caps["fourzone_rgb"]
+    return caps
+
+
+def cpu_package_temp():
+    coretemp = hwmon_by_name("coretemp")
+    if not coretemp:
+        return None
+
+    fallback = None
+    for temp_input in sorted(coretemp.glob("temp*_input")):
+        label = read_text(str(temp_input).replace("_input", "_label"))
+        value = milli_to_c(read_text(temp_input))
+        if value is None:
+            continue
+        if label == "Package id 0":
+            return value
+        if fallback is None:
+            fallback = value
+    return fallback
+
+
+def chassis_temp():
+    acpi = hwmon_by_name("acpitz")
+    if not acpi:
+        return None
+    return milli_to_c(read_text(acpi / "temp1_input"))
+
+
+def nvme_temp():
+    nvme = hwmon_by_name("nvme")
+    if not nvme:
+        return None
+    return milli_to_c(read_text(nvme / "temp1_input"))
+
+
+def nvidia_snapshot(enabled=True):
+    empty = {
+        "available": False,
+        "name": "n/a",
+        "driver": "n/a",
+        "temp": None,
+        "util": None,
+        "mem_util": None,
+        "power": None,
+        "power_limit": None,
+        "graphics_clock": None,
+        "memory_clock": None,
+        "pstate": "n/a",
+        "fan_speed": "N/A",
+    }
+    if not enabled:
+        return empty
+
+    query = (
+        "name,driver_version,temperature.gpu,utilization.gpu,"
+        "utilization.memory,power.draw,power.limit,clocks.current.graphics,"
+        "clocks.current.memory,pstate,fan.speed"
+    )
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--query-gpu={query}",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return empty
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return empty
+
+    values = [part.strip() for part in result.stdout.strip().splitlines()[0].split(",")]
+    if len(values) < 11:
+        return empty
+
+    def number(index):
+        raw = values[index]
+        if raw in {"[N/A]", "N/A", ""}:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    power = number(5)
+    power_limit = number(6)
+    if power is not None and power > 250:
+        power = None
+    if power_limit is not None and power_limit > 250:
+        power_limit = None
+
+    return {
+        "available": True,
+        "name": values[0],
+        "driver": values[1],
+        "temp": number(2),
+        "util": number(3),
+        "mem_util": number(4),
+        "power": power,
+        "power_limit": power_limit,
+        "graphics_clock": number(7),
+        "memory_clock": number(8),
+        "pstate": values[9],
+        "fan_speed": values[10],
+    }
+
+
+def collect_snapshot(config):
+    now = time.time()
+    fans = fan_rpms()
+    hold_pid = max_hold_pid()
+    deadline = max_hold_deadline() if hold_pid else None
+    remaining = None
+    if deadline:
+        remaining = max(0, int(deadline - now))
+
+    return {
+        "time": now,
+        "mode": fan_mode(),
+        "hold_pid": hold_pid,
+        "hold_remaining": remaining,
+        "fans": fans,
+        "cpu_temp": cpu_package_temp(),
+        "chassis_temp": chassis_temp(),
+        "nvme_temp": nvme_temp(),
+        "gpu": nvidia_snapshot(config.get("gpu_monitoring", True)),
+        "caps": capability_map(),
+    }
+
+
+def fmt_temp(value):
+    return "n/a" if value is None else f"{value:.1f} C"
+
+
+def fmt_percent(value):
+    return "n/a" if value is None else f"{value:.0f}%"
+
+
+def fmt_watts(value):
+    return "n/a" if value is None else f"{value:.1f} W"
+
+
+def fmt_clock(value):
+    return "n/a" if value is None else f"{value:.0f} MHz"
+
+
+def fmt_rpm(value):
+    return "n/a" if value is None else f"{value} RPM"
+
+
+def fmt_duration(seconds):
+    if seconds is None:
+        return "n/a"
+    seconds = max(0, int(seconds))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {sec:02d}s"
+    return f"{sec}s"
+
+
+def notify(title, body, config):
+    if not config.get("notifications", True):
+        return
+    try:
+        subprocess.Popen(["notify-send", title, body], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+class FanWindow(Gtk.Window):
+    def __init__(self, minimized=False):
+        super().__init__(title=APP_NAME)
+        self.config = load_config()
+        self.snapshot = None
+        self.busy = False
+        self.boost_active = False
+        self.hot_seconds = 0
+        self.cool_seconds = 0
+        self.last_hold_pid = None
+        self.warned_cpu_hot = False
+        self.warned_gpu_hot = False
+        self.tray = None
+        self.start_minimized = minimized
+
+        self.set_default_size(920, 680)
+        self.set_border_width(12)
+        self.connect("destroy", self.on_destroy)
+
+        self.install_css()
+        self.build_ui()
+
+        if self.config.get("reset_on_start", False):
+            self.run_action(["auto"], "Auto on launch")
+
+        self.refresh()
+        GLib.timeout_add_seconds(int(self.config["refresh_interval"]), self.refresh)
+    def install_css(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(
+            b"""
+            .title { font-size: 18px; font-weight: 700; }
+            .section { font-weight: 700; font-size: 13px; }
+            .muted { opacity: 0.62; font-size: 12px; }
+            .key { opacity: 0.78; }
+            .stat-label {
+              font-size: 10px;
+              font-weight: 600;
+              opacity: 0.6;
+            }
+            .stat-value {
+              font-size: 15px;
+              font-weight: 600;
+            }
+            .card {
+              background-color: alpha(@theme_fg_color, 0.05);
+              border: 1px solid alpha(@theme_fg_color, 0.12);
+              border-radius: 8px;
+              padding: 10px 12px;
+            }
+            .control-card {
+              background-color: alpha(@theme_fg_color, 0.07);
+              border: 1px solid alpha(@theme_fg_color, 0.14);
+              border-radius: 8px;
+              padding: 12px 14px;
+            }
+            button.suggested-action,
+            button.destructive-action {
+              padding-left: 16px;
+              padding-right: 16px;
+              font-weight: 600;
+            }
+            """
+        )
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+    def build_ui(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.add(root)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        root.pack_start(header, False, False, 0)
+
+        title = Gtk.Label(label=APP_NAME, xalign=0)
+        title.get_style_context().add_class("title")
+        header.pack_start(title, True, True, 0)
+
+        self.spinner = Gtk.Spinner()
+        header.pack_start(self.spinner, False, False, 0)
+
+        self.last_action = Gtk.Label(label="", xalign=1)
+        header.pack_start(self.last_action, False, False, 0)
+
+        self.notebook = Gtk.Notebook()
+        root.pack_start(self.notebook, True, True, 0)
+
+        self.build_dashboard()
+        self.build_rules()
+        self.build_advanced()
+        self.build_logs()
+
+    def build_dashboard(self):
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(8)
+        scroll.add(page)
+        self.notebook.append_page(scroll, Gtk.Label(label="Dashboard"))
+
+        self.labels = {}
+
+        controls_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        controls_card.get_style_context().add_class("control-card")
+        page.pack_start(controls_card, False, False, 0)
+
+        controls_title = Gtk.Label(label="Fan control", xalign=0)
+        controls_title.get_style_context().add_class("section")
+        controls_card.pack_start(controls_title, False, False, 0)
+
+        primary_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        controls_card.pack_start(primary_row, False, False, 0)
+
+        self.auto_button = Gtk.Button(label="Auto")
+        self.auto_button.get_style_context().add_class("suggested-action")
+        self.auto_button.connect("clicked", lambda _b: self.run_action(["auto"], "Auto"))
+        primary_row.pack_start(self.auto_button, False, False, 0)
+
+        self.max_button = Gtk.Button(label="Max")
+        self.max_button.get_style_context().add_class("destructive-action")
+        self.max_button.connect("clicked", lambda _b: self.run_action(["max"], "Max"))
+        primary_row.pack_start(self.max_button, False, False, 0)
+
+        primary_row.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 6)
+
+        hold_label = Gtk.Label(label="Hold Max for", xalign=0)
+        hold_label.get_style_context().add_class("muted")
+        primary_row.pack_start(hold_label, False, False, 0)
+
+        timed_group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        timed_group.get_style_context().add_class("linked")
+        primary_row.pack_start(timed_group, False, False, 0)
+        for label_text, duration in (("5m", "5m"), ("15m", "15m"), ("30m", "30m"), ("1h", "1h")):
+            button = Gtk.Button(label=label_text)
+            button.connect("clicked", lambda _b, d=duration: self.run_action(["max", "--for", d], f"Max {d}"))
+            timed_group.pack_start(button, True, True, 0)
+
+        primary_row.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 6)
+
+        custom_label = Gtk.Label(label="Custom", xalign=0)
+        custom_label.get_style_context().add_class("muted")
+        primary_row.pack_start(custom_label, False, False, 0)
+
+        self.custom_minutes_spin = Gtk.SpinButton()
+        self.custom_minutes_spin.set_range(1, 240)
+        self.custom_minutes_spin.set_increments(1, 10)
+        self.custom_minutes_spin.set_value(20)
+        primary_row.pack_start(self.custom_minutes_spin, False, False, 0)
+
+        custom_unit = Gtk.Label(label="min")
+        custom_unit.get_style_context().add_class("muted")
+        primary_row.pack_start(custom_unit, False, False, 0)
+
+        custom_button = Gtk.Button(label="Start")
+        custom_button.connect("clicked", lambda _b: self.start_custom_timer())
+        primary_row.pack_start(custom_button, False, False, 0)
+
+        status_grid = Gtk.Grid(column_spacing=24, row_spacing=0, column_homogeneous=True)
+        controls_card.pack_start(status_grid, False, False, 0)
+        self.labels["mode"] = self.add_stat(status_grid, 0, 0, "Mode")
+        self.labels["hold"] = self.add_stat(status_grid, 1, 0, "Max hold")
+        self.labels["timer"] = self.add_stat(status_grid, 2, 0, "Timer")
+
+        stats_card = self.make_card()
+        page.pack_start(stats_card, False, False, 0)
+        stats_grid = Gtk.Grid(column_spacing=24, row_spacing=8, column_homogeneous=True)
+        stats_card.pack_start(stats_grid, False, False, 0)
+        self.labels["fan1"] = self.add_stat(stats_grid, 0, 0, "Fan 1")
+        self.labels["fan2"] = self.add_stat(stats_grid, 1, 0, "Fan 2")
+        self.labels["cpu"] = self.add_stat(stats_grid, 2, 0, "CPU")
+        self.labels["gpu_temp"] = self.add_stat(stats_grid, 3, 0, "GPU")
+        self.labels["chassis"] = self.add_stat(stats_grid, 0, 1, "Chassis")
+        self.labels["nvme"] = self.add_stat(stats_grid, 1, 1, "NVMe")
+        self.labels["gpu_util"] = self.add_stat(stats_grid, 2, 1, "GPU load")
+        self.labels["gpu_power"] = self.add_stat(stats_grid, 3, 1, "GPU power")
+        self.labels["gpu_clocks"] = self.add_stat(stats_grid, 0, 2, "GPU clocks")
+        self.labels["gpu_state"] = self.add_stat(stats_grid, 1, 2, "GPU state")
+        self.labels["gpu_name"] = self.add_stat(stats_grid, 2, 2, "GPU model")
+
+        automax_card = self.make_card()
+        page.pack_start(automax_card, False, False, 0)
+        automax_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        automax_card.pack_start(automax_header, False, False, 0)
+        automax_title = Gtk.Label(label="Auto Max", xalign=0)
+        automax_title.get_style_context().add_class("section")
+        automax_header.pack_start(automax_title, True, True, 0)
+        self.auto_boost_check = Gtk.CheckButton(label="Enable")
+        self.auto_boost_check.set_active(bool(self.config["auto_boost_enabled"]))
+        automax_header.pack_start(self.auto_boost_check, False, False, 0)
+
+        automax_intro = Gtk.Label(
+            label="Switch to Max when any signal crosses its activate threshold; return to Auto once every signal falls below its release threshold.",
+            xalign=0,
+        )
+        automax_intro.get_style_context().add_class("muted")
+        automax_intro.set_line_wrap(True)
+        automax_intro.set_max_width_chars(72)
+        automax_card.pack_start(automax_intro, False, False, 0)
+
+        automax_grid = Gtk.Grid(column_spacing=14, row_spacing=8)
+        automax_card.pack_start(automax_grid, False, False, 0)
+
+        header_signal = Gtk.Label(label="Signal", xalign=0)
+        header_signal.get_style_context().add_class("stat-label")
+        automax_grid.attach(header_signal, 0, 0, 1, 1)
+        header_on = Gtk.Label(label="Activate at", xalign=0)
+        header_on.get_style_context().add_class("stat-label")
+        automax_grid.attach(header_on, 1, 0, 1, 1)
+        header_off = Gtk.Label(label="Release below", xalign=0)
+        header_off.get_style_context().add_class("stat-label")
+        automax_grid.attach(header_off, 2, 0, 1, 1)
+
+        self.rule_spins = {}
+        self.rule_spins["cpu_on"], self.rule_spins["cpu_off"] = self.add_threshold_row(
+            automax_grid, 1, "CPU temperature", "° C",
+            self.config["cpu_on"], 40, 105,
+            self.config["cpu_off"], 30, 100,
+        )
+        self.rule_spins["gpu_on"], self.rule_spins["gpu_off"] = self.add_threshold_row(
+            automax_grid, 2, "GPU temperature", "° C",
+            self.config["gpu_on"], 40, 100,
+            self.config["gpu_off"], 30, 95,
+        )
+        self.rule_spins["gpu_util_on"], self.rule_spins["gpu_util_off"] = self.add_threshold_row(
+            automax_grid, 3, "GPU load", "%",
+            self.config["gpu_util_on"], 0, 100,
+            self.config["gpu_util_off"], 0, 100,
+        )
+
+        delay_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        automax_card.pack_start(delay_row, False, False, 0)
+        delay_label = Gtk.Label(label="Hysteresis delay", xalign=0)
+        delay_row.pack_start(delay_label, False, False, 0)
+
+        activate_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        delay_row.pack_start(activate_box, False, False, 0)
+        activate_lbl = Gtk.Label(label="Activate after", xalign=0)
+        activate_lbl.get_style_context().add_class("muted")
+        activate_box.pack_start(activate_lbl, False, False, 0)
+        self.rule_spins["activate_delay"] = self.make_spin(self.config["activate_delay"], 0, 120)
+        activate_box.pack_start(self.rule_spins["activate_delay"], False, False, 0)
+        activate_unit = Gtk.Label(label="s")
+        activate_unit.get_style_context().add_class("muted")
+        activate_box.pack_start(activate_unit, False, False, 0)
+
+        release_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        delay_row.pack_start(release_box, False, False, 0)
+        release_lbl = Gtk.Label(label="Release after", xalign=0)
+        release_lbl.get_style_context().add_class("muted")
+        release_box.pack_start(release_lbl, False, False, 0)
+        self.rule_spins["deactivate_delay"] = self.make_spin(self.config["deactivate_delay"], 0, 300)
+        release_box.pack_start(self.rule_spins["deactivate_delay"], False, False, 0)
+        release_unit = Gtk.Label(label="s")
+        release_unit.get_style_context().add_class("muted")
+        release_box.pack_start(release_unit, False, False, 0)
+
+        save_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        automax_card.pack_start(save_box, False, False, 0)
+        save_auto = Gtk.Button(label="Save Auto Max")
+        save_auto.connect("clicked", lambda _b: self.save_rules())
+        save_box.pack_end(save_auto, False, False, 0)
+
+        self.capability_label = Gtk.Label(label="", xalign=0)
+        self.capability_label.get_style_context().add_class("muted")
+        self.capability_label.set_line_wrap(True)
+        page.pack_start(self.capability_label, False, False, 0)
+
+    def make_card(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.get_style_context().add_class("card")
+        box.set_hexpand(True)
+        return box
+
+    def make_spin(self, value, minimum, maximum, step=1):
+        spin = Gtk.SpinButton()
+        spin.set_range(minimum, maximum)
+        spin.set_increments(step, step * 5)
+        spin.set_value(value)
+        return spin
+
+    def add_stat(self, grid, column, row, title):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        grid.attach(box, column, row, 1, 1)
+        label = Gtk.Label(label=title, xalign=0)
+        label.get_style_context().add_class("stat-label")
+        box.pack_start(label, False, False, 0)
+        value = Gtk.Label(label="n/a", xalign=0)
+        value.get_style_context().add_class("stat-value")
+        box.pack_start(value, False, False, 0)
+        return value
+
+    def add_threshold_row(self, grid, row, title, unit, on_value, on_min, on_max, off_value, off_min, off_max):
+        label = Gtk.Label(label=title, xalign=0)
+        grid.attach(label, 0, row, 1, 1)
+        on_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        on_spin = self.make_spin(on_value, on_min, on_max)
+        on_box.pack_start(on_spin, False, False, 0)
+        on_unit = Gtk.Label(label=unit)
+        on_unit.get_style_context().add_class("muted")
+        on_box.pack_start(on_unit, False, False, 0)
+        grid.attach(on_box, 1, row, 1, 1)
+        off_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        off_spin = self.make_spin(off_value, off_min, off_max)
+        off_box.pack_start(off_spin, False, False, 0)
+        off_unit = Gtk.Label(label=unit)
+        off_unit.get_style_context().add_class("muted")
+        off_box.pack_start(off_unit, False, False, 0)
+        grid.attach(off_box, 2, row, 1, 1)
+        return on_spin, off_spin
+
+    def start_custom_timer(self):
+        minutes = int(self.custom_minutes_spin.get_value())
+        self.run_action(["max", "--for", f"{minutes}m"], f"Max {minutes}m")
+
+    def add_spin_row(self, grid, row, label, value, minimum, maximum, step=1):
+        key = Gtk.Label(label=label, xalign=0)
+        key.get_style_context().add_class("key")
+        grid.attach(key, 0, row, 1, 1)
+        spin = Gtk.SpinButton()
+        spin.set_range(minimum, maximum)
+        spin.set_increments(step, step * 5)
+        spin.set_value(value)
+        grid.attach(spin, 1, row, 1, 1)
+        return spin
+
+    def build_rules(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.set_border_width(8)
+        self.notebook.append_page(page, Gtk.Label(label="Settings"))
+
+        warning_card = self.make_card()
+        page.pack_start(warning_card, False, False, 0)
+        warning_title = Gtk.Label(label="Warnings", xalign=0)
+        warning_title.get_style_context().add_class("section")
+        warning_card.pack_start(warning_title, False, False, 0)
+        warning_grid = Gtk.Grid(column_spacing=16, row_spacing=8)
+        warning_card.pack_start(warning_grid, False, False, 0)
+        self.rule_spins["high_cpu_warning"] = self.add_spin_row(
+            warning_grid, 0, "CPU Warning", self.config["high_cpu_warning"], 50, 110
+        )
+        self.rule_spins["high_gpu_warning"] = self.add_spin_row(
+            warning_grid, 1, "GPU Warning", self.config["high_gpu_warning"], 50, 105
+        )
+
+        checks = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        page.pack_start(checks, False, False, 0)
+
+        self.notify_check = Gtk.CheckButton(label="Notifications")
+        self.notify_check.set_active(bool(self.config["notifications"]))
+        checks.pack_start(self.notify_check, False, False, 0)
+
+        self.gpu_monitor_check = Gtk.CheckButton(label="GPU Monitoring")
+        self.gpu_monitor_check.set_active(bool(self.config["gpu_monitoring"]))
+        checks.pack_start(self.gpu_monitor_check, False, False, 0)
+
+        self.reset_start_check = Gtk.CheckButton(label="Auto on App Start")
+        self.reset_start_check.set_active(bool(self.config["reset_on_start"]))
+        checks.pack_start(self.reset_start_check, False, False, 0)
+
+        self.reset_exit_check = Gtk.CheckButton(label="Auto on App Exit")
+        self.reset_exit_check.set_active(bool(self.config["reset_on_exit"]))
+        checks.pack_start(self.reset_exit_check, False, False, 0)
+
+        self.autostart_check = Gtk.CheckButton(label="Start in Tray on Login")
+        self.autostart_check.set_active(bool(self.config["autostart"]))
+        checks.pack_start(self.autostart_check, False, False, 0)
+
+        save = Gtk.Button(label="Save Rules")
+        save.connect("clicked", lambda _button: self.save_rules())
+        page.pack_start(save, False, False, 0)
+
+    def build_advanced(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.set_border_width(8)
+        self.notebook.append_page(page, Gtk.Label(label="Advanced"))
+
+        manual_frame = Gtk.Frame(label="Manual RPM")
+        page.pack_start(manual_frame, False, False, 0)
+        manual_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        manual_box.set_border_width(10)
+        manual_frame.add(manual_box)
+
+        manual_grid = Gtk.Grid(column_spacing=16, row_spacing=8)
+        manual_box.pack_start(manual_grid, False, False, 0)
+        self.fan1_spin = self.add_spin_row(manual_grid, 0, "Fan 1 RPM", 3000, 0, 7000, 100)
+        self.fan2_spin = self.add_spin_row(manual_grid, 1, "Fan 2 RPM", 3000, 0, 7000, 100)
+        self.manual_apply = Gtk.Button(label="Apply Manual RPM")
+        self.manual_apply.connect("clicked", lambda _button: self.apply_manual())
+        manual_box.pack_start(self.manual_apply, False, False, 0)
+        self.manual_note = Gtk.Label(label="", xalign=0)
+        manual_box.pack_start(self.manual_note, False, False, 0)
+
+        curve_frame = Gtk.Frame(label="Better Auto Curve")
+        page.pack_start(curve_frame, False, False, 0)
+        curve_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        curve_box.set_border_width(10)
+        curve_frame.add(curve_box)
+        self.better_auto_check = Gtk.CheckButton(label="Better Auto")
+        self.better_auto_check.set_active(bool(self.config["better_auto_enabled"]))
+        curve_box.pack_start(self.better_auto_check, False, False, 0)
+
+        self.curve_grid = Gtk.Grid(column_spacing=14, row_spacing=6)
+        curve_box.pack_start(self.curve_grid, False, False, 0)
+        self.curve_spins = []
+        for idx, level in enumerate(self.config["better_auto_levels"]):
+            temp_spin = self.add_spin_row(self.curve_grid, idx, f"Level {idx + 1} Temp", level["temp"], 35, 100)
+            pct_spin = Gtk.SpinButton()
+            pct_spin.set_range(20, 100)
+            pct_spin.set_increments(5, 10)
+            pct_spin.set_value(level["percent"])
+            self.curve_grid.attach(pct_spin, 2, idx, 1, 1)
+            pct_label = Gtk.Label(label="%", xalign=0)
+            self.curve_grid.attach(pct_label, 3, idx, 1, 1)
+            self.curve_spins.append((temp_spin, pct_spin))
+
+        curve_save = Gtk.Button(label="Save Curve")
+        curve_save.connect("clicked", lambda _button: self.save_rules())
+        curve_box.pack_start(curve_save, False, False, 0)
+
+        rgb_frame = Gtk.Frame(label="Keyboard RGB")
+        page.pack_start(rgb_frame, False, False, 0)
+        rgb_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        rgb_box.set_border_width(10)
+        rgb_frame.add(rgb_box)
+        self.color_button = Gtk.ColorButton()
+        self.color_button.connect("color-set", self.apply_rgb_color)
+        rgb_box.pack_start(self.color_button, False, False, 0)
+        self.brightness = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 255, 1)
+        self.brightness.set_value(128)
+        self.brightness.connect("value-changed", self.apply_rgb_brightness)
+        rgb_box.pack_start(self.brightness, True, True, 0)
+        self.rgb_note = Gtk.Label(label="", xalign=0)
+        page.pack_start(self.rgb_note, False, False, 0)
+
+    def build_logs(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        page.set_border_width(8)
+        self.notebook.append_page(page, Gtk.Label(label="Log"))
+
+        scroll = Gtk.ScrolledWindow()
+        page.pack_start(scroll, True, True, 0)
+        self.log_view = Gtk.TextView()
+        self.log_view.set_editable(False)
+        self.log_view.set_monospace(True)
+        scroll.add(self.log_view)
+
+        clear = Gtk.Button(label="Clear Log")
+        clear.connect("clicked", lambda _button: self.clear_log())
+        page.pack_start(clear, False, False, 0)
+        self.load_log()
+
+    def setup_tray(self):
+        if not self.config.get("tray", True):
+            return
+        try:
+            self.tray = Gtk.StatusIcon.new_from_icon_name("preferences-system-power-management")
+            self.tray.set_title(APP_NAME)
+            self.tray.set_visible(True)
+            self.tray.connect("activate", lambda _icon: self.present_window())
+            self.tray.connect("popup-menu", self.show_tray_menu)
+        except Exception:
+            self.tray = None
+
+    def show_tray_menu(self, _icon, button, activate_time):
+        menu = Gtk.Menu()
+        items = [
+            ("Open", lambda *_: self.present_window()),
+            ("Max", lambda *_: self.run_action(["max"], "Max")),
+            ("Max 15 min", lambda *_: self.run_action(["max", "--for", "15m"], "Max 15m")),
+            ("Auto", lambda *_: self.run_action(["auto"], "Auto")),
+            ("Quit", lambda *_: self.destroy()),
+        ]
+        for label, callback in items:
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", callback)
+            menu.append(item)
+        menu.show_all()
+        menu.popup(None, None, None, None, button, activate_time)
+
+    def present_window(self):
+        self.show_all()
+        self.present()
+
+    def set_busy(self, busy, text=""):
+        self.busy = busy
+        self.auto_button.set_sensitive(not busy)
+        self.max_button.set_sensitive(not busy)
+        self.manual_apply.set_sensitive(not busy and self.manual_apply.get_sensitive())
+        self.last_action.set_text(text)
+        if busy:
+            self.spinner.start()
+        else:
+            self.spinner.stop()
+
+    def refresh(self):
+        self.snapshot = collect_snapshot(self.config)
+        snap = self.snapshot
+        fans = snap["fans"]
+        gpu = snap["gpu"]
+
+        self.labels["mode"].set_text(snap["mode"]["label"].upper())
+
+        if snap["hold_pid"]:
+            self.labels["hold"].set_text(f"running (pid {snap['hold_pid']})")
+        else:
+            self.labels["hold"].set_text("stopped")
+
+        if snap["hold_pid"] and snap["hold_remaining"] is not None:
+            self.labels["timer"].set_text(fmt_duration(snap["hold_remaining"]))
+        else:
+            self.labels["timer"].set_text("—")
+
+        self.labels["fan1"].set_text(fmt_rpm(fans["fan1"]))
+        self.labels["fan2"].set_text(fmt_rpm(fans["fan2"]))
+        self.labels["cpu"].set_text(fmt_temp(snap["cpu_temp"]))
+        self.labels["gpu_temp"].set_text(fmt_temp(gpu["temp"]))
+
+        self.labels["chassis"].set_text(fmt_temp(snap["chassis_temp"]))
+        self.labels["nvme"].set_text(fmt_temp(snap["nvme_temp"]))
+        self.labels["gpu_util"].set_text(fmt_percent(gpu["util"]))
+        self.labels["gpu_power"].set_text(fmt_watts(gpu["power"]))
+        self.labels["gpu_clocks"].set_text(f"{fmt_clock(gpu['graphics_clock'])} / {fmt_clock(gpu['memory_clock'])}")
+        self.labels["gpu_state"].set_text(gpu["pstate"] if gpu["available"] else "n/a")
+
+        if gpu["available"]:
+            short_name = gpu["name"].replace("NVIDIA ", "").replace(" Laptop GPU", "")
+            self.labels["gpu_name"].set_text(short_name)
+        elif not self.config.get("gpu_monitoring", True):
+            self.labels["gpu_name"].set_text("monitoring off")
+        else:
+            self.labels["gpu_name"].set_text("n/a")
+
+        self.update_capability_ui(snap["caps"], fans)
+        self.evaluate_rules(snap)
+        self.check_hold_transition(snap)
+        self.update_tray(snap)
+        return True
+
+    def update_capability_ui(self, caps, fans):
+        bits = []
+        bits.append("manual RPM available" if caps["manual_targets"] else "manual RPM unavailable")
+        bits.append("keyboard RGB available" if caps["keyboard_rgb"] else "keyboard RGB unavailable")
+        bits.append("GPU stats available" if self.snapshot["gpu"]["available"] else "GPU stats unavailable")
+        self.capability_label.set_text("   ·   ".join(bits))
+
+        manual_ok = caps["manual_targets"]
+        self.manual_apply.set_sensitive(manual_ok and not self.busy)
+        self.better_auto_check.set_sensitive(manual_ok and caps["manual_targets_writable"])
+        self.manual_note.set_text(
+            "Patched hp-wmi fan target files detected." if manual_ok else "Manual RPM needs patched hp-wmi fan target files."
+        )
+
+        for idx in (1, 2):
+            max_rpm = fans.get(f"fan{idx}_max") or 7000
+            spin = self.fan1_spin if idx == 1 else self.fan2_spin
+            spin.set_range(0, max_rpm)
+
+        rgb_ok = caps["keyboard_rgb"]
+        self.color_button.set_sensitive(rgb_ok)
+        self.brightness.set_sensitive(rgb_ok)
+        self.rgb_note.set_text("Keyboard lighting interface detected." if rgb_ok else "Keyboard lighting interface not detected.")
+
+    def check_hold_transition(self, snap):
+        pid = snap["hold_pid"]
+        if self.last_hold_pid and not pid and snap["mode"]["raw"] == "2":
+            self.log("Max hold ended; fan mode is auto")
+            notify(APP_NAME, "Max hold ended; fan mode is auto", self.config)
+        self.last_hold_pid = pid
+
+    def evaluate_rules(self, snap):
+        self.warn_if_hot(snap)
+        if self.config.get("better_auto_enabled") and snap["caps"]["manual_targets_writable"]:
+            self.evaluate_better_auto(snap)
+        if not self.config.get("auto_boost_enabled", False):
+            self.hot_seconds = 0
+            self.cool_seconds = 0
+            return
+
+        interval = int(self.config["refresh_interval"])
+        gpu = snap["gpu"]
+        hot_reasons = []
+        if snap["cpu_temp"] is not None and snap["cpu_temp"] >= self.config["cpu_on"]:
+            hot_reasons.append(f"CPU {snap['cpu_temp']:.0f} C")
+        if gpu["temp"] is not None and gpu["temp"] >= self.config["gpu_on"]:
+            hot_reasons.append(f"GPU {gpu['temp']:.0f} C")
+        if gpu["util"] is not None and gpu["util"] >= self.config["gpu_util_on"]:
+            hot_reasons.append(f"GPU {gpu['util']:.0f}%")
+
+        cool = True
+        if snap["cpu_temp"] is not None and snap["cpu_temp"] > self.config["cpu_off"]:
+            cool = False
+        if gpu["temp"] is not None and gpu["temp"] > self.config["gpu_off"]:
+            cool = False
+        if gpu["util"] is not None and gpu["util"] > self.config["gpu_util_off"]:
+            cool = False
+
+        if hot_reasons:
+            self.hot_seconds += interval
+            self.cool_seconds = 0
+        elif cool:
+            self.cool_seconds += interval
+            self.hot_seconds = 0
+        else:
+            self.hot_seconds = 0
+            self.cool_seconds = 0
+
+        if not self.boost_active and self.hot_seconds >= self.config["activate_delay"]:
+            if self.busy:
+                return
+            reason = ", ".join(hot_reasons) or "threshold"
+            self.boost_active = True
+            self.log(f"Auto Boost started: {reason}")
+            notify(APP_NAME, f"Auto Boost started: {reason}", self.config)
+            self.run_action(["max"], "Auto Boost")
+        elif self.boost_active and self.cool_seconds >= self.config["deactivate_delay"]:
+            if self.busy:
+                return
+            self.boost_active = False
+            self.log("Auto Boost cooled down; returning to auto")
+            notify(APP_NAME, "Auto Boost cooled down; returning to auto", self.config)
+            self.run_action(["auto"], "Auto Boost Auto")
+
+    def warn_if_hot(self, snap):
+        cpu = snap["cpu_temp"]
+        gpu = snap["gpu"]["temp"]
+        if cpu is not None and cpu >= self.config["high_cpu_warning"] and not self.warned_cpu_hot:
+            self.warned_cpu_hot = True
+            self.log(f"High CPU temperature: {cpu:.0f} C")
+            notify(APP_NAME, f"High CPU temperature: {cpu:.0f} C", self.config)
+        elif cpu is not None and cpu < self.config["high_cpu_warning"] - 8:
+            self.warned_cpu_hot = False
+
+        if gpu is not None and gpu >= self.config["high_gpu_warning"] and not self.warned_gpu_hot:
+            self.warned_gpu_hot = True
+            self.log(f"High GPU temperature: {gpu:.0f} C")
+            notify(APP_NAME, f"High GPU temperature: {gpu:.0f} C", self.config)
+        elif gpu is not None and gpu < self.config["high_gpu_warning"] - 8:
+            self.warned_gpu_hot = False
+
+    def evaluate_better_auto(self, snap):
+        hottest = max(v for v in [snap["cpu_temp"], snap["gpu"]["temp"]] if v is not None) if (snap["cpu_temp"] is not None or snap["gpu"]["temp"] is not None) else None
+        if hottest is None:
+            return
+        fans = snap["fans"]
+        max1 = fans["fan1_max"] or 6000
+        max2 = fans["fan2_max"] or 6000
+        percent = 0
+        for level in sorted(self.config["better_auto_levels"], key=lambda item: item["temp"]):
+            if hottest >= level["temp"]:
+                percent = level["percent"]
+        if percent <= 0:
+            return
+        rpm1 = int(max1 * percent / 100)
+        rpm2 = int(max2 * percent / 100)
+        now = time.time()
+        if getattr(self, "last_better_auto_apply", 0) + 30 > now:
+            return
+        if self.busy:
+            return
+        self.last_better_auto_apply = now
+        self.run_action(["manual", str(rpm1), str(rpm2)], "Better Auto")
+
+    def update_tray(self, snap):
+        if not self.tray:
+            return
+        gpu_temp = fmt_temp(snap["gpu"]["temp"])
+        text = f"{snap['mode']['label']} | CPU {fmt_temp(snap['cpu_temp'])} | GPU {gpu_temp}"
+        self.tray.set_tooltip_text(text)
+
+    def save_rules(self):
+        self.config["auto_boost_enabled"] = self.auto_boost_check.get_active()
+        self.config["notifications"] = self.notify_check.get_active()
+        self.config["gpu_monitoring"] = self.gpu_monitor_check.get_active()
+        self.config["reset_on_start"] = self.reset_start_check.get_active()
+        self.config["reset_on_exit"] = self.reset_exit_check.get_active()
+        self.config["autostart"] = self.autostart_check.get_active()
+        self.config["better_auto_enabled"] = self.better_auto_check.get_active()
+
+        for key, spin in self.rule_spins.items():
+            self.config[key] = int(spin.get_value())
+
+        levels = []
+        for temp_spin, pct_spin in self.curve_spins:
+            levels.append({"temp": int(temp_spin.get_value()), "percent": int(pct_spin.get_value())})
+        self.config["better_auto_levels"] = levels
+
+        save_config(self.config)
+        self.sync_autostart()
+        self.log("Saved configuration")
+
+    def sync_autostart(self):
+        AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if self.config["autostart"]:
+            AUTOSTART_FILE.write_text(
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                f"Name={APP_NAME}\n"
+                f"Exec={GUI_EXEC} --minimized\n"
+                "Terminal=false\n"
+                "X-GNOME-Autostart-enabled=true\n"
+            )
+        else:
+            try:
+                AUTOSTART_FILE.unlink()
+            except FileNotFoundError:
+                pass
+
+    def apply_manual(self):
+        fan1 = int(self.fan1_spin.get_value())
+        fan2 = int(self.fan2_spin.get_value())
+        self.run_action(["manual", str(fan1), str(fan2)], "Manual RPM")
+
+    def apply_rgb_color(self, button):
+        rgba = button.get_rgba()
+        r, g, b = int(rgba.red * 255), int(rgba.green * 255), int(rgba.blue * 255)
+        single = Path("/sys/class/leds/hp::kbd_backlight/multi_intensity")
+        zones = Path("/sys/devices/platform/hp-wmi/rgb_zones")
+        if single.exists():
+            self.write_privileged(single, f"{r} {g} {b}\n")
+        elif (zones / "zone00").exists():
+            value = f"{r:02X}{g:02X}{b:02X}\n"
+            for zone in sorted(zones.glob("zone0*")):
+                self.write_privileged(zone, value)
+
+    def apply_rgb_brightness(self, scale):
+        path = Path("/sys/class/leds/hp::kbd_backlight/brightness")
+        if path.exists():
+            self.write_privileged(path, f"{int(scale.get_value())}\n")
+
+    def write_privileged(self, path, value):
+        path = Path(path)
+        if os.access(path, os.W_OK):
+            try:
+                path.write_text(value)
+                return
+            except OSError as exc:
+                self.log(f"Write failed: {exc}")
+                return
+        def write_with_pkexec():
+            subprocess.run(
+                ["pkexec", "/usr/bin/tee", str(path)],
+                input=value,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+
+        threading.Thread(target=write_with_pkexec, daemon=True).start()
+
+    def run_action(self, args, label):
+        self.set_busy(True, label)
+        threading.Thread(target=self._run_action, args=(args, label), daemon=True).start()
+
+    def _run_action(self, args, label):
+        try:
+            result = subprocess.run([FANCTL] + args, text=True, capture_output=True, timeout=90, check=False)
+            GLib.idle_add(self.finish_action, args, label, result.returncode, result.stderr)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            GLib.idle_add(self.finish_action, args, label, 1, str(exc))
+
+    def finish_action(self, args, label, returncode, stderr):
+        self.set_busy(False)
+        self.refresh()
+        if returncode == 0:
+            self.log(f"{label}: ok")
+            if args and args[0] == "auto":
+                self.boost_active = False
+            return False
+
+        message = stderr.strip() or f"{label} failed"
+        self.log(f"{label}: {message}")
+        notify(APP_NAME, message, self.config)
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text="Fan command failed",
+        )
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
+        return False
+
+    def log(self, message):
+        write_log(message)
+        self.load_log()
+
+    def load_log(self):
+        buffer = self.log_view.get_buffer()
+        try:
+            lines = EVENT_LOG.read_text().splitlines()[-300:]
+        except OSError:
+            lines = []
+        buffer.set_text("\n".join(lines))
+
+    def clear_log(self):
+        ensure_dirs()
+        EVENT_LOG.write_text("")
+        self.load_log()
+
+    def on_destroy(self, _window):
+        if self.config.get("reset_on_exit", False):
+            subprocess.Popen([FANCTL, "auto"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        Gtk.main_quit()
+
+
+def main():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    minimized = "--minimized" in sys.argv
+    if "--self-test" in sys.argv:
+        settings = Gtk.Settings.get_default()
+        if settings:
+            settings.set_property("gtk-application-prefer-dark-theme", True)
+        win = FanWindow(minimized=False)
+        win.show_all()
+        labels = []
+        for i in range(win.notebook.get_n_pages()):
+            tab = win.notebook.get_tab_label(win.notebook.get_nth_page(i))
+            labels.append(tab.get_text())
+        print("tabs=" + ",".join(labels))
+        print("mode=" + win.labels["mode"].get_text())
+        print("fan1=" + win.labels["fan1"].get_text())
+        print("gpu=" + win.labels["gpu_temp"].get_text())
+        print("dark_preferred=true")
+        win.hide()
+        return
+
+    win = FanWindow(minimized=minimized)
+    win.show_all()
+    win.setup_tray()
+    if minimized and win.tray:
+        win.hide()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

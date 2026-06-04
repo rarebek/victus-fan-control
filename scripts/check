@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+
+bash -n "$repo_dir/bin/fanctl"
+python3 -m py_compile "$repo_dir/bin/fanctl-gui"
+
+if grep -R --line-number '/home/nadir' "$repo_dir" \
+  --exclude-dir=.git \
+  --exclude=check \
+  --exclude='*.pyc'; then
+  printf 'Hardcoded local path found.\n' >&2
+  exit 1
+fi
+
+printf 'checks ok\n'

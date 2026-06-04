@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.log
+.cache/
+.venv/
+dist/
+build/
+pkg/
+src/
+*.pkg.tar.*
+victus-fan-control/

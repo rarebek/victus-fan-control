@@ -1,0 +1,517 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+app_id="victus-fan-control"
+state_dir="${FANCTL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/$app_id}"
+log_file="$state_dir/events.log"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  fanctl status
+  fanctl monitor [seconds]
+  fanctl max [--for 5m|15m|30m|1h]
+  fanctl auto
+  fanctl manual <fan1-rpm> <fan2-rpm>
+  fanctl set-target <fan-number> <rpm>
+  fanctl capabilities
+
+This controls only HP/Victus fan interfaces exposed through Linux hwmon.
+It does not install or patch hp-wmi by itself.
+EOF
+}
+
+die() {
+  printf 'fanctl: %s\n' "$*" >&2
+  exit 1
+}
+
+self_path() {
+  if [[ "$0" == */* ]]; then
+    readlink -f -- "$0" 2>/dev/null || printf '%s\n' "$0"
+  else
+    command -v -- "$0" 2>/dev/null || printf '%s\n' "$0"
+  fi
+}
+
+log_event() {
+  mkdir -p "$state_dir"
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$log_file"
+}
+
+hwmon_by_name() {
+  local wanted=$1 dir name
+  for dir in /sys/class/hwmon/hwmon*; do
+    [[ -r "$dir/name" ]] || continue
+    name=$(<"$dir/name")
+    [[ "$name" == "$wanted" ]] || continue
+    printf '%s\n' "$dir"
+    return 0
+  done
+  return 1
+}
+
+hp_hwmon_dir() {
+  hwmon_by_name hp || return 1
+}
+
+runtime_dir() {
+  if [[ -n "${FANCTL_RUNTIME_DIR:-}" ]]; then
+    printf '%s\n' "$FANCTL_RUNTIME_DIR"
+  elif [[ "$(id -u)" == 0 && -n "${PKEXEC_UID:-}" ]]; then
+    printf '/run/user/%s\n' "$PKEXEC_UID"
+  elif [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    printf '%s\n' "$XDG_RUNTIME_DIR"
+  else
+    printf '/run/user/%s\n' "$(id -u)"
+  fi
+}
+
+validate_runtime_dir() {
+  local dir=$1
+  [[ "$dir" =~ ^/run/user/[0-9]+$ ]] || die "unsafe runtime dir: $dir"
+  [[ -d "$dir" ]] || die "runtime dir does not exist: $dir"
+}
+
+stop_file_for() {
+  printf '%s/fanctl-max.stop\n' "$1"
+}
+
+pid_file_for() {
+  printf '%s/fanctl-max.pid\n' "$1"
+}
+
+deadline_file_for() {
+  printf '%s/fanctl-max.deadline\n' "$1"
+}
+
+read_one() {
+  local file=$1
+  if [[ -r "$file" ]]; then
+    tr -d '\n' <"$file"
+  else
+    printf 'n/a'
+  fi
+}
+
+temp_c() {
+  local millideg=$1
+  awk -v t="$millideg" 'BEGIN { printf "%.1f", t / 1000 }'
+}
+
+duration_to_seconds() {
+  local value=$1 amount unit
+  [[ "$value" =~ ^([0-9]+)([smh]?)$ ]] || die "invalid duration: $value"
+  amount=${BASH_REMATCH[1]}
+  unit=${BASH_REMATCH[2]:-m}
+
+  case "$unit" in
+    s) printf '%s\n' "$amount" ;;
+    m|'') printf '%s\n' "$((amount * 60))" ;;
+    h) printf '%s\n' "$((amount * 3600))" ;;
+    *) die "invalid duration unit: $unit" ;;
+  esac
+}
+
+current_pwm_mode() {
+  local dir
+  dir=$(hp_hwmon_dir) || return 1
+  read_one "$dir/pwm1_enable"
+}
+
+fan_mode_label() {
+  local mode
+  mode=$(current_pwm_mode) || {
+    printf 'unavailable'
+    return
+  }
+
+  case "$mode" in
+    0) printf 'max (0)' ;;
+    1) printf 'manual (1)' ;;
+    2) printf 'auto (2)' ;;
+    *) printf 'unknown (%s)' "$mode" ;;
+  esac
+}
+
+max_hold_pid() {
+  local dir pid_file pid
+  dir=$(runtime_dir)
+  validate_runtime_dir "$dir"
+  pid_file=$(pid_file_for "$dir")
+  [[ -r "$pid_file" ]] || return 1
+  pid=$(<"$pid_file")
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  printf '%s\n' "$pid"
+}
+
+max_hold_deadline() {
+  local dir file
+  dir=$(runtime_dir)
+  validate_runtime_dir "$dir"
+  file=$(deadline_file_for "$dir")
+  [[ -r "$file" ]] || return 1
+  read_one "$file"
+}
+
+print_fans() {
+  local dir fan rpm target max printed=0
+  if dir=$(hp_hwmon_dir); then
+    for fan in "$dir"/fan*_input; do
+      [[ -r "$fan" ]] || continue
+      rpm=$(<"$fan")
+      target=${fan%_input}_target
+      max=${fan%_input}_max
+      if [[ -r "$target" || -r "$max" ]]; then
+        printf '  %-8s %s RPM  target=%s max=%s\n' \
+          "$(basename "${fan%_input}")" \
+          "$rpm" \
+          "$(read_one "$target")" \
+          "$(read_one "$max")"
+      else
+        printf '  %-8s %s RPM\n' "$(basename "${fan%_input}")" "$rpm"
+      fi
+      printed=1
+    done
+  fi
+
+  [[ "$printed" == 1 ]] || printf '  n/a\n'
+}
+
+print_temps() {
+  local dir label input value printed=0
+  for dir in /sys/class/hwmon/hwmon*; do
+    [[ -r "$dir/name" ]] || continue
+    case "$(<"$dir/name")" in
+      coretemp|acpitz|nvme|mt7921_phy0) ;;
+      *) continue ;;
+    esac
+
+    for input in "$dir"/temp*_input; do
+      [[ -r "$input" ]] || continue
+      label=${input%_input}_label
+      if [[ -r "$label" ]]; then
+        label=$(<"$label")
+      else
+        label=$(<"$dir/name")
+      fi
+      value=$(<"$input")
+      printf '  %-18s %s C\n' "$label" "$(temp_c "$value")"
+      printed=1
+    done
+  done
+
+  [[ "$printed" == 1 ]] || printf '  n/a\n'
+}
+
+print_capabilities() {
+  local dir
+  if ! dir=$(hp_hwmon_dir); then
+    printf 'hp_hwmon=no\n'
+    return 0
+  fi
+
+  printf 'hp_hwmon=yes\n'
+  [[ -r "$dir/pwm1_enable" ]] && printf 'fan_mode=yes\n' || printf 'fan_mode=no\n'
+  [[ -r "$dir/fan1_input" ]] && printf 'fan1_rpm=yes\n' || printf 'fan1_rpm=no\n'
+  [[ -r "$dir/fan2_input" ]] && printf 'fan2_rpm=yes\n' || printf 'fan2_rpm=no\n'
+  [[ -e "$dir/fan1_target" && -e "$dir/fan2_target" ]] && printf 'manual_targets=yes\n' || printf 'manual_targets=no\n'
+  [[ -e "$dir/fan1_max" && -e "$dir/fan2_max" ]] && printf 'fan_max=yes\n' || printf 'fan_max=no\n'
+  [[ -e /sys/class/leds/hp::kbd_backlight || -e /sys/devices/platform/hp-wmi/rgb_zones/zone00 ]] && printf 'keyboard_rgb=yes\n' || printf 'keyboard_rgb=no\n'
+}
+
+status() {
+  local pid deadline now remaining
+  printf 'Fan mode: %s\n' "$(fan_mode_label)"
+  if pid=$(max_hold_pid 2>/dev/null); then
+    printf 'Max hold: running (pid %s)\n' "$pid"
+    if deadline=$(max_hold_deadline 2>/dev/null); then
+      if [[ "$deadline" =~ ^[0-9]+$ && "$deadline" -gt 0 ]]; then
+        now=$(date +%s)
+        remaining=$((deadline - now))
+        (( remaining < 0 )) && remaining=0
+        printf 'Max timer: %ss remaining\n' "$remaining"
+      fi
+    fi
+  else
+    printf 'Max hold: stopped\n'
+  fi
+  printf '\nFans:\n'
+  print_fans
+  printf '\nTemperatures:\n'
+  print_temps
+}
+
+notify_mode() {
+  local mode=$1
+  if command -v notify-send >/dev/null 2>&1 && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    notify-send 'Fan mode' "$mode" >/dev/null 2>&1 || true
+  fi
+}
+
+write_pwm_mode() {
+  local value=$1 dir
+  case "$value" in
+    0|1|2) ;;
+    *) die "invalid pwm mode: $value" ;;
+  esac
+
+  dir=$(hp_hwmon_dir) || die "HP hwmon device not found"
+  [[ -w "$dir/pwm1_enable" ]] || die "missing writable $dir/pwm1_enable"
+  printf '%s\n' "$value" >"$dir/pwm1_enable"
+}
+
+write_target() {
+  local fan=$1 rpm=$2 dir target max max_rpm
+  [[ "$fan" =~ ^[12]$ ]] || die "fan number must be 1 or 2"
+  [[ "$rpm" =~ ^[0-9]+$ ]] || die "rpm must be a positive integer"
+
+  dir=$(hp_hwmon_dir) || die "HP hwmon device not found"
+  target="$dir/fan${fan}_target"
+  max="$dir/fan${fan}_max"
+  [[ -e "$target" ]] || die "manual target not exposed: $target"
+  if [[ -r "$max" ]]; then
+    max_rpm=$(<"$max")
+    if [[ "$max_rpm" =~ ^[0-9]+$ && "$max_rpm" -gt 0 && "$rpm" -gt "$max_rpm" ]]; then
+      die "rpm $rpm exceeds fan${fan} max $max_rpm"
+    fi
+  fi
+
+  write_pwm_mode 1
+  printf '%s\n' "$rpm" >"$target"
+}
+
+write_manual_pair() {
+  local fan1=$1 fan2=$2
+  write_target 1 "$fan1"
+  sleep 10
+  write_target 2 "$fan2"
+}
+
+auth_write_pwm_mode() {
+  local value=$1 executable
+  executable=$(self_path)
+
+  if [[ "$(id -u)" == 0 ]]; then
+    write_pwm_mode "$value"
+  elif command -v pkexec >/dev/null 2>&1; then
+    pkexec "$executable" --write-pwm "$value"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$executable" --write-pwm "$value"
+  else
+    die "need pkexec or sudo to write fan mode"
+  fi
+}
+
+auth_write_target() {
+  local fan=$1 rpm=$2 executable
+  executable=$(self_path)
+
+  if [[ "$(id -u)" == 0 ]]; then
+    write_target "$fan" "$rpm"
+  elif command -v pkexec >/dev/null 2>&1; then
+    pkexec "$executable" --write-target "$fan" "$rpm"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$executable" --write-target "$fan" "$rpm"
+  else
+    die "need pkexec or sudo to write fan target"
+  fi
+}
+
+auth_write_manual_pair() {
+  local fan1=$1 fan2=$2 executable
+  executable=$(self_path)
+
+  if [[ "$(id -u)" == 0 ]]; then
+    write_manual_pair "$fan1" "$fan2"
+  elif command -v pkexec >/dev/null 2>&1; then
+    pkexec "$executable" --write-manual-pair "$fan1" "$fan2"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$executable" --write-manual-pair "$fan1" "$fan2"
+  else
+    die "need pkexec or sudo to write manual fan targets"
+  fi
+}
+
+hold_max_loop() {
+  local dir=$1 deadline=${2:-0} stop_file pid_file deadline_file now file_deadline
+  validate_runtime_dir "$dir"
+  stop_file=$(stop_file_for "$dir")
+  pid_file=$(pid_file_for "$dir")
+  deadline_file=$(deadline_file_for "$dir")
+
+  trap 'rm -f "$pid_file" "$deadline_file"' EXIT
+  while [[ ! -e "$stop_file" ]]; do
+    write_pwm_mode 0 || true
+    if [[ -r "$deadline_file" ]]; then
+      file_deadline=$(<"$deadline_file")
+      [[ "$file_deadline" =~ ^[0-9]+$ ]] && deadline="$file_deadline"
+    fi
+    if [[ "$deadline" =~ ^[0-9]+$ && "$deadline" -gt 0 ]]; then
+      now=$(date +%s)
+      if (( now >= deadline )); then
+        write_pwm_mode 2 || true
+        log_event "Max timer expired; returned to auto"
+        break
+      fi
+    fi
+    sleep 2
+  done
+  rm -f "$stop_file"
+}
+
+start_max_hold_root() {
+  local dir=$1 deadline=${2:-0} pid_file deadline_file old_pid
+  validate_runtime_dir "$dir"
+  pid_file=$(pid_file_for "$dir")
+  deadline_file=$(deadline_file_for "$dir")
+  rm -f "$(stop_file_for "$dir")"
+
+  if [[ -r "$pid_file" ]]; then
+    old_pid=$(<"$pid_file")
+    if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
+      [[ "$deadline" =~ ^[0-9]+$ && "$deadline" -gt 0 ]] && printf '%s\n' "$deadline" >"$deadline_file"
+      write_pwm_mode 0
+      return 0
+    fi
+  fi
+
+  if [[ "$deadline" =~ ^[0-9]+$ && "$deadline" -gt 0 ]]; then
+    printf '%s\n' "$deadline" >"$deadline_file"
+  else
+    rm -f "$deadline_file"
+  fi
+
+  nohup "$(self_path)" --hold-max "$dir" "$deadline" >/dev/null 2>&1 &
+  printf '%s\n' "$!" >"$pid_file"
+}
+
+auth_start_max_hold() {
+  local duration=${1:-0} dir deadline=0 executable
+  executable=$(self_path)
+  dir=$(runtime_dir)
+  validate_runtime_dir "$dir"
+  rm -f "$(stop_file_for "$dir")"
+
+  if [[ "$duration" != 0 ]]; then
+    deadline=$(($(date +%s) + duration))
+  fi
+
+  if [[ "$(id -u)" == 0 ]]; then
+    start_max_hold_root "$dir" "$deadline"
+  elif command -v pkexec >/dev/null 2>&1; then
+    pkexec "$executable" --start-max-hold "$dir" "$deadline"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$executable" --start-max-hold "$dir" "$deadline"
+  else
+    die "need pkexec or sudo to hold max fan mode"
+  fi
+}
+
+stop_max_hold() {
+  local dir
+  dir=$(runtime_dir)
+  validate_runtime_dir "$dir"
+  : >"$(stop_file_for "$dir")"
+  sleep 0.3
+}
+
+set_max() {
+  local duration=0 label="max"
+  if [[ "${1:-}" == "--for" ]]; then
+    [[ $# -eq 2 ]] || die "usage: fanctl max --for 15m"
+    duration=$(duration_to_seconds "$2")
+    label="max for ${2}"
+  elif [[ $# -ne 0 ]]; then
+    die "usage: fanctl max [--for 15m]"
+  fi
+
+  auth_start_max_hold "$duration"
+  log_event "Fan mode set to $label"
+  notify_mode "$label"
+}
+
+set_auto() {
+  if ! max_hold_pid >/dev/null 2>&1 && [[ "$(current_pwm_mode 2>/dev/null || true)" == 2 ]]; then
+    notify_mode auto
+    return 0
+  fi
+
+  stop_max_hold
+  auth_write_pwm_mode 2
+  log_event "Fan mode set to auto"
+  notify_mode auto
+}
+
+main() {
+  local cmd=${1:-status} delay
+
+  case "$cmd" in
+    --write-pwm)
+      [[ $# -eq 2 ]] || die "internal pwm write needs one mode"
+      write_pwm_mode "$2"
+      ;;
+    --write-target)
+      [[ $# -eq 3 ]] || die "internal target write needs fan and rpm"
+      write_target "$2" "$3"
+      ;;
+    --write-manual-pair)
+      [[ $# -eq 3 ]] || die "internal manual write needs two rpm values"
+      write_manual_pair "$2" "$3"
+      ;;
+    --start-max-hold)
+      [[ $# -eq 3 ]] || die "internal hold start needs runtime dir and deadline"
+      start_max_hold_root "$2" "$3"
+      ;;
+    --hold-max)
+      [[ $# -eq 3 ]] || die "internal hold needs runtime dir and deadline"
+      hold_max_loop "$2" "$3"
+      ;;
+    status)
+      status
+      ;;
+    capabilities)
+      print_capabilities
+      ;;
+    monitor)
+      delay=${2:-2}
+      while true; do
+        clear
+        date '+%F %T'
+        status
+        sleep "$delay"
+      done
+      ;;
+    max)
+      shift
+      set_max "$@"
+      status
+      ;;
+    auto)
+      set_auto
+      status
+      ;;
+    set-target)
+      [[ $# -eq 3 ]] || die "usage: fanctl set-target <fan-number> <rpm>"
+      auth_write_target "$2" "$3"
+      log_event "Fan $2 target set to $3 RPM"
+      status
+      ;;
+    manual)
+      [[ $# -eq 3 ]] || die "usage: fanctl manual <fan1-rpm> <fan2-rpm>"
+      auth_write_manual_pair "$2" "$3"
+      log_event "Manual fan targets set fan1=$2 fan2=$3 RPM"
+      status
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

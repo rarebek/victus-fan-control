@@ -1,0 +1,22 @@
+[Desktop Entry]
+Type=Application
+Name=Victus Fan Control
+Comment=Control HP Victus fan modes and monitor temperatures
+Exec=@BINDIR@/fanctl-gui
+Terminal=false
+Categories=Settings;System;
+Icon=preferences-system-power-management
+StartupNotify=true
+Actions=Max;Max15;Auto;
+
+[Desktop Action Max]
+Name=Fan Max
+Exec=@BINDIR@/fanctl max
+
+[Desktop Action Max15]
+Name=Fan Max 15 Minutes
+Exec=@BINDIR@/fanctl max --for 15m
+
+[Desktop Action Auto]
+Name=Fan Auto
+Exec=@BINDIR@/fanctl auto
